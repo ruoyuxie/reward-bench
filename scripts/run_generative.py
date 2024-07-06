@@ -53,6 +53,7 @@ if HF_TOKEN is not None:
     _login(token=HF_TOKEN, add_to_git_credential=False)
 
 
+
 def get_args():
     """
     Parse arguments strings model and chat_template
@@ -62,7 +63,7 @@ def get_args():
         "--model",
         type=str,
         nargs="+",  # allow list of models (ensemble)
-        required=True,
+        required=False,
         help="name of OpenAI model to use (TODO add more providers/models)",
     )
     parser.add_argument("--chat_template", type=str, default=None, help="fastchat chat template (optional)")
@@ -86,7 +87,42 @@ def get_args():
     parser.add_argument(
         "--force_local", action="store_true", default=False, help="force local run, even if model is on Together API"
     )
+    parser.add_argument(
+        "--moa",
+        action="store_true",
+        help="Use Mixture of Agents approach",
+    )
+    parser.add_argument(
+        "--reference_models",
+        nargs="+",
+        default=["microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat", "Qwen/Qwen2-72B-Instruct", "meta-llama/Llama-3-70b-chat-hf", "mistralai/Mixtral-8x22B-Instruct-v0.1", "databricks/dbrx-instruct"],
+        help="List of reference models for MoA",
+    )
+    parser.add_argument(
+        "--aggregator_model",
+        type=str,
+        default="Qwen/Qwen2-72B-Instruct",
+        help="Aggregator model for MoA",
+    )
     args = parser.parse_args()
+    
+    args.do_not_save = True
+    args.force_local = True
+    #args.debug = True
+    args.debug = False
+    args.moa = True
+    #args.moa = False
+
+    args.num_gpus = 2
+
+    # args.num_threads = 1
+    args.reference_models =["microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat", "Qwen/Qwen2-72B-Instruct", "meta-llama/Llama-3-70b-chat-hf", "mistralai/Mixtral-8x22B-Instruct-v0.1", "databricks/dbrx-instruct"]
+    #args.reference_models =["microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat"]
+    args.aggregator_model = "Qwen/Qwen2-72B-Instruct"
+    args.model = "prometheus-eval/prometheus-7b-v2.0"
+    #args.model = "meta-llama/Meta-Llama-3-8B-Instruct"
+    #args.model = "meta-llama/Llama-3-8b-chat-hf"
+    
     return args
 
 
@@ -104,19 +140,20 @@ def main():
     log_level = logging.INFO
     logger.setLevel(log_level)
 
-    logger.info(f"Running reward model on {args.model} with chat template {args.chat_template}")
+    if args.moa:
+        model_type = "Generative RM MoA"
+        args.model = args.reference_models + [args.aggregator_model]
+        logger.info(f"Running reward models using MoA with reference models {args.reference_models} and aggregator model {args.aggregator_model}")
+    elif isinstance(args.model, list) and len(args.model) > 1:
+        model_type = "Generative RM PoLL"
+        assert len(args.model) % 2 == 1, "Number of models for PoLL must be odd"
+    else:
+        model_type = "Generative RM"
+        logger.info(f"Running reward model on {args.model} with chat template {args.chat_template}")
 
-    model_type = "Generative RM"
+        if isinstance(args.model, list) and len(args.model) == 1:
+            args.model = args.model[0]
 
-    # if model is list, make type + PoLL and check multiple is odd
-    if isinstance(args.model, list) and len(args.model) == 1:
-        args.model = args.model[0]
-    elif isinstance(args.model, list):
-        model_type += " PoLL"
-        # assert that is odd and > 1
-        assert len(args.model) % 2 == 1
-
-    # define variable if is API or local
     is_api_models = isinstance(args.model, list) or args.model in API_MODEL_LIST or not args.force_local
 
     # if model isn't API, load via vllm
@@ -166,11 +203,12 @@ def main():
     ids = dataset["id"]
     dataset = dataset.remove_columns("id")
 
-    # debug: use only 10 examples
+    # debug: use only a few examples
     if args.debug:
-        dataset = dataset.select(range(10))
-        subsets = subsets[:10]
-        ids = ids[:10]
+        debug_size = 100
+        dataset = dataset.select(range(debug_size))
+        subsets = subsets[:debug_size]
+        ids = ids[:debug_size]
 
     if is_api_models:
         ############################
@@ -200,15 +238,15 @@ def main():
 
             if len(batch["text_chosen"]) <= 4:  # set up only for 1 or 2 turns
                 winner, request, judgement = run_judge_pair(
-                    prompt, answer_a, answer_b, args.model, multi_turn=mult_turn, model_modifier=model_modifier
+                    prompt, answer_a, answer_b, args.model, multi_turn=mult_turn, 
+                    model_modifier=model_modifier, use_moa=args.moa
                 )
                 if debug:
                     print(f"Prompt: {request}")
                     print(f"Judgement: {judgement}")
 
-                # handle voting
-                if isinstance(winner, list):
-                    # print votes if debug
+                # handle voting for PoLL
+                if isinstance(winner, list) and not args.moa:
                     if debug:
                         print(winner)
                     winner = max(set(winner), key=winner.count)
@@ -272,10 +310,6 @@ def main():
                 prompt = optional_chat_template.get_prompt()
             elif model_modifier:
                 messages = [
-                    {
-                        "role": "system",
-                        "content": system_prompt,
-                    },
                     {"role": "user", "content": user_prompt},
                 ]
                 prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -331,8 +365,11 @@ def main():
 
     # model name concat if list
     if isinstance(args.model, list):
-        model_name = "_".join(args.model)
-        model_name = "PoLL/" + model_name
+        if args.moa:
+            model_name = f"MoA/{args.aggregator_model}"
+        else:
+            model_name = "_".join(args.model)
+            model_name = "PoLL/" + model_name
     else:
         model_name = args.model
     # if model in openai or Anthropic list, append org to model name
@@ -348,6 +385,9 @@ def main():
     results_grouped["model"] = model_name
     results_grouped["model_type"] = model_type
     results_grouped["chat_template"] = args.chat_template
+    if args.moa:
+        results_grouped["reference_models"] = args.reference_models
+        results_grouped["aggregator_model"] = args.aggregator_model
 
     # print per subset and log into results_grouped file
     present_subsets = np.unique(subsets)

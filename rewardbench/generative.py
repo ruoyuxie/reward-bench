@@ -59,7 +59,7 @@ OPENAI_MODEL_LIST = (
 
 # feel free to add more models to this list via PR
 # available models: https://docs.together.ai/docs/inference-models
-TOGETHER_MODEL_LIST = ("meta-llama/Llama-3-70b-chat-hf", "meta-llama/Llama-3-8b-chat-hf")
+TOGETHER_MODEL_LIST = ("meta-llama/Llama-3-70b-chat-hf", "meta-llama/Llama-3-8b-chat-hf", "microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat", "Qwen/Qwen2-72B-Instruct", "mistralai/Mixtral-8x22B-Instruct-v0.1", "databricks/dbrx-instruct", "Qwen/Qwen2-72B-Instruct" )
 
 GEMINI_MODEL_LIST = ("gemini-1.5-flash-001", "gemini-1.5-pro-001")
 
@@ -257,14 +257,14 @@ def process_judgement(judgment, is_prometheus=False):
 
 
 # noqa adapted from FastChat https://github.com/lm-sys/FastChat/blob/b015f21cb9d0cf3c87d2a5e53008074c537e8be0/fastchat/llm_judge/common.py#L235C1-L312C1
-def run_judge_pair(question, answer_a, answer_b, model, multi_turn=False, model_modifier=None):
+def run_judge_pair(question, answer_a, answer_b, model, multi_turn=False, model_modifier=None, use_moa=False):
     system_prompt, user_prompt = format_judge_answers(
         question, answer_a, answer_b, multi_turn, model_modifier=model_modifier
     )
     winner = "error"
 
-    # handle multi-model (ensembles) recursively
-    if isinstance(model, list):
+    # Handle multi-model (ensembles) recursively
+    if isinstance(model, list) and not use_moa:
         winners = []
         judgments = []
         for m in model:
@@ -273,6 +273,11 @@ def run_judge_pair(question, answer_a, answer_b, model, multi_turn=False, model_
             judgments.append(judgment)
         return winners, user_prompt, judgments
 
+    # Handle MoA approach
+    elif isinstance(model, list) and use_moa:
+        return run_moa(question, answer_a, answer_b, model[:-1], model[-1], multi_turn)
+
+    # Handle single model cases
     if model in OPENAI_MODEL_LIST:
         template = "chatgpt"
         conv = get_conv_template(template)
@@ -303,13 +308,44 @@ def run_judge_pair(question, answer_a, answer_b, model, multi_turn=False, model_
         conv.append_message(conv.roles[1], None)
         conv.set_system_message(system_prompt)
         judgment = chat_completion_together(model, conv, temperature=0, max_tokens=2048)
-
     else:
         raise ValueError(f"Model {model} not supported")
 
     winner = process_judgement(judgment)
     return winner, user_prompt, judgment
 
+def run_moa(question, answer_a, answer_b, reference_models, aggregator_model, multi_turn):
+    reference_judgments = []
+    for model in reference_models:
+        _, _, judgment = run_judge_pair(question, answer_a, answer_b, model, multi_turn)
+        reference_judgments.append(judgment)
+        
+    judgments_formatted = "\n".join("Model {}: {}".format(i+1, judgment) for i, judgment in enumerate(reference_judgments))
+    aggregator_prompt = f"""You are an impartial meta-judge tasked with synthesizing evaluations from multiple AI models regarding the performance of two AI assistants (A and B) in response to a user's question. Your goal is to produce a single, high-quality judgment that determines which assistant provided the better response.
+
+User's question: {question}
+
+You have been provided with judgments from various open-source models. Your task is to critically evaluate these judgments and synthesize them into a final, authoritative decision. It is crucial to critically evaluate the information provided in these responses, recognizing that some of it may be biased or incorrect. Your synthesized judgment should not simply replicate or average the given answers. Instead, offer a refined, well-reasoned decision that represents the most accurate and reliable evaluation of the assistants' performances.
+
+Judgments from multiple models:
+{judgments_formatted}
+
+Based on these evaluations and your critical analysis, provide your final judgment in the following format:
+1. A concise explanation of your reasoning, highlighting key factors that influenced your decision.
+2. Your final verdict as either "[[A]]" if assistant A performed better, or "[[B]]" if assistant B performed better.
+
+Ensure your response is well-structured, coherent, and adheres to the highest standards of impartiality and analytical rigor."""
+
+    template = "chatgpt"  # Using chatgpt template for Together API
+    conv = get_conv_template(template)
+    conv.append_message(conv.roles[0], aggregator_prompt)
+    conv.append_message(conv.roles[1], None)
+    conv.set_system_message("You are an impartial meta-judge tasked with synthesizing multiple AI evaluations to produce a final, authoritative judgment.")
+
+    aggregator_judgment = chat_completion_together(aggregator_model, conv, temperature=0, max_tokens=2048)
+    
+    winner = process_judgement(aggregator_judgment)
+    return winner, aggregator_prompt, aggregator_judgment
 
 # also uses ArenaHard code
 # noqa https://github.com/lm-sys/arena-hard/blob/51c04e5a6449e920c01d4159f56a051216af6bd9/utils.py#L166
