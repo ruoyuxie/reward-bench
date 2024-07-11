@@ -73,11 +73,11 @@ API_ERROR_OUTPUT = "$ERROR$"
 
 prompt_v2 = (
     "Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user question displayed below. "  # noqa
-    "You should choose the assistant that follows the user's instructions and answers the user's question better. Your evaluation should consider "  # noqa
+    "You should choose the assistant that follows the user's instructions and answers the user query better. Your evaluation should consider "  # noqa
     "factors such as the helpfulness, relevance, accuracy, depth, creativity, and level of detail of their responses. Begin your evaluation by "  # noqa
-    "comparing the two responses and provide a short explanation. Avoid any position biases and ensure that the order in which the responses were "  # noqa
+    "comparing the two responses and provide your explanation. Carefully evaluate the strengths and weaknesses of each response. Avoid any position biases and ensure that the order in which the responses were "  # noqa
     "presented does not influence your decision. Do not allow the length of the responses to influence your evaluation. Do not favor certain names "  # noqa
-    "of the assistants. Be as objective as possible. After providing your explanation, output your final verdict by strictly following this format: "  # noqa
+    "of the assistants. Be as objective as possible. Explain your reasoning process and provide a final decision by strictly following this format:"  # noqa
     '"[[A]]" if assistant A is better, "[[B]]" if assistant B is better.'  # noqa, removed tie option as , and \"[[C]]\ " for a tie
 )
 
@@ -90,7 +90,7 @@ prompt_v2 = (
 # [Prompt]: [Instruction1]
 prompt_v2_gemini = (
     "Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user question displayed below. "  # noqa
-    "You should choose the assistant that follows the user's instructions and answers the user's question better. "  # noqa
+    "You should choose the assistant that follows the user's instructions and answers the user query better. "  # noqa
     "Your evaluation should consider factors such as the helpfulness, relevance, accuracy, depth, creativity, and level of detail of their responses. "  # noqa
     "Avoid any position biases and ensure that the order in which the responses were presented does not influence your decision. "  # noqa
     "Do not allow the length of the responses to influence your evaluation. Do not favor certain names of the assistants. "  # noqa
@@ -101,7 +101,7 @@ prompt_v2_gemini = (
 prompt_multi_v2 = (
     "Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user questions. "  # noqa
     "You should focus on who provides a better answer to the second user question. "  # noqa
-    "You should choose the assistant that follows the user's instructions and answers the user's question better. Your evaluation should consider "  # noqa
+    "You should choose the assistant that follows the user's instructions and answers the user query better. Your evaluation should consider "  # noqa
     "factors such as the helpfulness, relevance, accuracy, depth, creativity, and level of detail of their responses. Begin your evaluation by "  # noqa
     "comparing the two responses and provide a short explanation. Avoid any position biases and ensure that the order in which the responses were "  # noqa
     "presented does not influence your decision. Do not allow the length of the responses to influence your evaluation. Do not favor certain names "  # noqa
@@ -190,6 +190,39 @@ ABS_SYSTEM_PROMPT = "You are a fair judge assistant tasked with providing clear,
 REL_SYSTEM_PROMPT = "You are a fair judge assistant assigned to deliver insightful feedback that compares individual performances, highlighting how each stands relative to others within the same cohort."  # noqa
 
 
+SCORE_BASED_REFERENCE_PROMPT = """
+Evaluate the following response to the given user query. Consider factors such as helpfulness, relevance, accuracy, depth, creativity, and level of detail. Assign a score from 1 to 5 carefully based on the following criteria:
+
+1 - Poor: The response is irrelevant, inaccurate, or harmful.
+2 - Below Average: The response is somewhat relevant but lacks depth or contains minor inaccuracies.
+3 - Average: The response is relevant and mostly accurate but could be more comprehensive or creative.
+4 - Good: The response is relevant, accurate, and provides good depth and detail.
+5 - Excellent: The response is highly relevant, accurate, comprehensive, and demonstrates creativity and insight.
+
+User query: {question}
+
+Response to evaluate:
+{response}
+
+Provide a explanation of your evaluation and then output your score strictly in the following format: [SCORE: X] where X is the numeric score (1-5).
+"""
+
+SCORE_BASED_AGGREGATOR_PROMPT = """
+As an impartial meta-judge, your task is to synthesize evaluations from multiple evaluators regarding the performance of two AI assistants (A and B) in response to a user query. Each evaluator has provided a score from 1 to 5 for each assistant's response. Your goal is to produce a single, high-quality judgment that determines which assistant provided the better response based on these scores.
+
+User query: {question}
+
+Evaluations:
+{evaluations}
+
+Analyze the scores and explanations provided by the evaluators. Consider any patterns or discrepancies in the scoring. Provide a brief synthesis of the evaluations, explaining which assistant seems to have performed better overall and why.
+
+Then, provide your final verdict using the following format:
+[[A]] if assistant A is better, or [[B]] if assistant B is better.
+
+In case of a tie in average scores, use your judgment based on the qualitative feedback to break the tie.
+"""
+
 # format with prompt_template.format(question=question, answer_a=answer_a, answer_b=answer_b)
 def format_judge_answers(question, answer_a, answer_b, multi_turn=False, model_modifier=None):
     kwargs = {}
@@ -234,118 +267,163 @@ def format_judge_answers(question, answer_a, answer_b, multi_turn=False, model_m
     return system_prompt, user_prompt
 
 
-def process_judgement(judgment, is_prometheus=False):
-    if is_prometheus:
-        if "[RESULT]" in judgment:
-            # after [RESULT] is A or B, else error (mayube spaces)
-            # result = judgment.split("[RESULT]")[1].strip()
-            if judgment[-1] == "A":
-                return "A"
-            elif judgment[-1] == "B":
-                return "B"
+def process_judgement(judgment, is_prometheus=False, evaluation_style="binary"):
+    if isinstance(judgment, tuple):  # MoA case
+        _, aggregator_judgment = judgment
+        judgment = aggregator_judgment
+    
+    if evaluation_style == "binary":
+        if is_prometheus:
+            if "[RESULT]" in judgment:
+                if judgment[-1] == "A":
+                    return "A"
+                elif judgment[-1] == "B":
+                    return "B"
+                else:
+                    return "error"
             else:
                 return "error"
         else:
-            return "error"
-    else:
-        if "[[A]]" in judgment:
-            return "A"
-        elif "[[B]]" in judgment:
-            return "B"
-        else:
-            return "error"
-
+            if "[[A]]" in judgment:
+                return "A"
+            elif "[[B]]" in judgment:
+                return "B"
+            else:
+                return "error"
+    else:  # score-based
+        if isinstance(judgment, tuple):  # Single model case
+            score_a = int(judgment[0].split("[SCORE: ")[1].split("]")[0])
+            score_b = int(judgment[1].split("[SCORE: ")[1].split("]")[0])
+            return "A" if score_a > score_b else "B" if score_b > score_a else "error"
+        else:  # Aggregator case
+            if "[[A]]" in judgment:
+                return "A"
+            elif "[[B]]" in judgment:
+                return "B"
+            else:
+                return "error"
 
 # noqa adapted from FastChat https://github.com/lm-sys/FastChat/blob/b015f21cb9d0cf3c87d2a5e53008074c537e8be0/fastchat/llm_judge/common.py#L235C1-L312C1
-def run_judge_pair(question, answer_a, answer_b, model, multi_turn=False, model_modifier=None, use_moa=False):
-    system_prompt, user_prompt = format_judge_answers(
-        question, answer_a, answer_b, multi_turn, model_modifier=model_modifier
-    )
+def get_model_completion(model, prompt, system_prompt="", temperature=1, max_tokens=1):
+    """Helper function to get completion from different model types."""
+    if model in OPENAI_MODEL_LIST:
+        template = "chatgpt"
+        conv = get_conv_template(template)
+        conv.append_message(conv.roles[0], prompt)
+        conv.append_message(conv.roles[1], None)
+        conv.set_system_message(system_prompt)
+        return chat_completion_openai(model, conv, temperature=temperature, max_tokens=max_tokens)
+    elif model in ANTHROPIC_MODEL_LIST:
+        template = "claude"
+        conv = get_conv_template(template)
+        conv.set_system_message(system_prompt)
+        conv.append_message(conv.roles[0], prompt)
+        conv.append_message(conv.roles[1], None)
+        conv.messages = conv.to_openai_api_messages()
+        return chat_completion_anthropic(model, conv, temperature=temperature, max_tokens=max_tokens)
+    elif model in GEMINI_MODEL_LIST:
+        return chat_completion_gemini(model, prompt, temperature=temperature, max_tokens=max_tokens)
+    elif model in TOGETHER_MODEL_LIST:
+        template = "chatgpt"
+        conv = get_conv_template(template)
+        conv.append_message(conv.roles[0], prompt)
+        conv.append_message(conv.roles[1], None)
+        conv.set_system_message(system_prompt)
+        return chat_completion_together(model, conv, temperature=temperature, max_tokens=max_tokens)
+    else:
+        raise ValueError(f"Model {model} not supported")
+
+def run_judge_pair(question, answer_a, answer_b, model, multi_turn=False, model_modifier=None, use_moa=False, evaluation_style="binary"):
+    if evaluation_style == "binary":
+        system_prompt, user_prompt = format_judge_answers(
+            question, answer_a, answer_b, multi_turn, model_modifier=model_modifier
+        )
+    else:  # score-based
+        system_prompt = ""
+        user_prompt = SCORE_BASED_REFERENCE_PROMPT
+
     winner = "error"
 
-    # Handle multi-model (ensembles) recursively
+    # Handle multi-model (ensembles) recursively, not MoA
     if isinstance(model, list) and not use_moa:
         winners = []
         judgments = []
         for m in model:
-            winner, _, judgment = run_judge_pair(question, answer_a, answer_b, m, multi_turn)
+            winner, _, judgment = run_judge_pair(question, answer_a, answer_b, m, multi_turn, evaluation_style=evaluation_style)
             winners.append(winner)
             judgments.append(judgment)
         return winners, user_prompt, judgments
 
     # Handle MoA approach
     elif isinstance(model, list) and use_moa:
-        return run_moa(question, answer_a, answer_b, model[:-1], model[-1], multi_turn)
-
-    # Handle single model cases
-    if model in OPENAI_MODEL_LIST:
-        template = "chatgpt"
-        conv = get_conv_template(template)
-
-        conv.append_message(conv.roles[0], user_prompt)
-        conv.append_message(conv.roles[1], None)
-        conv.set_system_message(system_prompt)
-
-        judgment = chat_completion_openai(model, conv, temperature=0, max_tokens=2048)
-    elif model in ANTHROPIC_MODEL_LIST:
-        template = "claude"
-        conv = get_conv_template(template)
-
-        conv.set_system_message(system_prompt)
-        conv.append_message(conv.roles[0], user_prompt)
-        conv.append_message(conv.roles[1], None)
-        conv.messages = conv.to_openai_api_messages()
-
-        judgment = chat_completion_anthropic(model, conv, temperature=0, max_tokens=1024)
-    elif model in GEMINI_MODEL_LIST:
-        text = user_prompt
-        judgment = chat_completion_gemini(model, text, temperature=0, max_tokens=4096)
-    elif model in TOGETHER_MODEL_LIST:
-        template = "chatgpt"  # template doesn't matter, it just uses raw messages later
-        conv = get_conv_template(template)
-
-        conv.append_message(conv.roles[0], user_prompt)
-        conv.append_message(conv.roles[1], None)
-        conv.set_system_message(system_prompt)
-        judgment = chat_completion_together(model, conv, temperature=0, max_tokens=2048)
-    else:
-        raise ValueError(f"Model {model} not supported")
-
-    winner = process_judgement(judgment)
-    return winner, user_prompt, judgment
-
-def run_moa(question, answer_a, answer_b, reference_models, aggregator_model, multi_turn):
-    reference_judgments = []
-    for model in reference_models:
-        _, _, judgment = run_judge_pair(question, answer_a, answer_b, model, multi_turn)
-        reference_judgments.append(judgment)
+        reference_models = model[:-1]
+        aggregator_model = model[-1]
+        reference_judgments = []
         
-    judgments_formatted = "\n".join("Model {}: {}".format(i+1, judgment) for i, judgment in enumerate(reference_judgments))
-    aggregator_prompt = f"""You are an impartial meta-judge tasked with synthesizing evaluations from multiple AI models regarding the performance of two AI assistants (A and B) in response to a user's question. Your goal is to produce a single, high-quality judgment that determines which assistant provided the better response.
+        for ref_model in reference_models:
+            if evaluation_style == "binary":
+                _, _, judgment = run_judge_pair(question, answer_a, answer_b, ref_model, multi_turn)
+                reference_judgments.append(judgment)
+            else:  # score-based
+                _, _, judgment_a = run_judge_pair(question, answer_a, None, ref_model, multi_turn, evaluation_style=evaluation_style)
+                _, _, judgment_b = run_judge_pair(question, answer_b, None, ref_model, multi_turn, evaluation_style=evaluation_style)
+                reference_judgments.append((judgment_a, judgment_b))
+        
+        # Prepare input for aggregator model
+        if evaluation_style == "binary":
+            judgments_formatted = "\n".join(f"Evaluator {i+1}: {judgment}" for i, judgment in enumerate(reference_judgments))
+            aggregator_prompt = f"""Given a user query and judgments from multiple evaluators, your task is to critically evaluate each judgment and synthesize them into a final, authoritative decision. It is crucial to critically evaluate the information provided from the evaluators, recognizing that some of it may be biased or incorrect. Your synthesized judgment should not simply replicate the given judgments. Instead, offer a refined, well-reasoned decision that represents the most accurate and reliable evaluation of the AI assistants' performances. Ensure your response is well-structured, coherent, and adheres to the highest standards of impartiality and analytical rigor.
 
-User's question: {question}
+User query: {question}
 
-You have been provided with judgments from various open-source models. Your task is to critically evaluate these judgments and synthesize them into a final, authoritative decision. It is crucial to critically evaluate the information provided in these responses, recognizing that some of it may be biased or incorrect. Your synthesized judgment should not simply replicate or average the given answers. Instead, offer a refined, well-reasoned decision that represents the most accurate and reliable evaluation of the assistants' performances.
-
-Judgments from multiple models:
+Judgments from evaluators:
 {judgments_formatted}
 
-Based on these evaluations and your critical analysis, provide your final judgment in the following format:
-1. A concise explanation of your reasoning, highlighting key factors that influenced your decision.
-2. Your final verdict as either "[[A]]" if assistant A performed better, or "[[B]]" if assistant B performed better.
+Explain your reasoning process and provide a final verdict by strictly following this format: "[[A]]" if assistant A is better, "[[B]]" if assistant B is better.
+"""
+        else:  # score-based
+            evaluations = []
+            for i, (judgment_a, judgment_b) in enumerate(reference_judgments):
+                evaluations.append(f"Evaluator {i+1}:\nAssistant A: {judgment_a}\nAssistant B: {judgment_b}")
+            judgments_formatted = "\n\n".join(evaluations)
+            aggregator_prompt = SCORE_BASED_AGGREGATOR_PROMPT.format(question=question, evaluations=judgments_formatted)
+        
+        aggregated_system_prompt = """You are an impartial meta-judge tasked with synthesizing evaluations from multiple evaluators regarding the performance of two AI assistants (A and B) in response to a user query. Your goal is to produce a single, high-quality judgment that determines which assistant provided the better response. """
+        
+        # Call the aggregator model using the helper function
+        aggregator_judgment = get_model_completion(aggregator_model, aggregator_prompt, aggregated_system_prompt)
+        
+        winner = process_judgement(aggregator_judgment, evaluation_style=evaluation_style)
+        return winner, user_prompt, (reference_judgments, aggregator_judgment)
 
-Ensure your response is well-structured, coherent, and adheres to the highest standards of impartiality and analytical rigor."""
-
-    template = "chatgpt"  # Using chatgpt template for Together API
-    conv = get_conv_template(template)
-    conv.append_message(conv.roles[0], aggregator_prompt)
-    conv.append_message(conv.roles[1], None)
-    conv.set_system_message("You are an impartial meta-judge tasked with synthesizing multiple AI evaluations to produce a final, authoritative judgment.")
-
-    aggregator_judgment = chat_completion_together(aggregator_model, conv, temperature=0, max_tokens=2048)
+    # Handle single model cases
+    else:
+        if evaluation_style == "binary":
+            judgment = get_model_completion(model, user_prompt, system_prompt)
+        else:  # score-based
+            judgment_a = get_model_completion(model, user_prompt.format(question=question, response=answer_a[1]["content"]), system_prompt)
+            judgment_b = get_model_completion(model, user_prompt.format(question=question, response=answer_b[1]["content"]), system_prompt)
+            judgment = (judgment_a, judgment_b)
+        winner = process_judgement(judgment, evaluation_style=evaluation_style)
+        return winner, user_prompt, judgment
     
-    winner = process_judgement(aggregator_judgment)
-    return winner, aggregator_prompt, aggregator_judgment
+def chat_completion_together(model, conv, temperature, max_tokens, api_dict=None):
+    client = Together(api_key=os.environ["TOGETHER_API_KEY"])
+    output = API_ERROR_OUTPUT
+    for _ in range(API_MAX_RETRY):
+        try:
+            messages = conv.to_openai_api_messages()
+            response = client.chat.completions.create(
+                model=model, messages=messages, n=1, temperature=temperature, max_tokens=max_tokens
+            )
+            output = response.choices[0].message.content
+            break
+        # except any exception
+        except Exception as e:
+            print(f"Failed to connect to Together API: {e}")
+            time.sleep(API_RETRY_SLEEP)
+    return output
+
 
 # also uses ArenaHard code
 # noqa https://github.com/lm-sys/arena-hard/blob/51c04e5a6449e920c01d4159f56a051216af6bd9/utils.py#L166
@@ -429,24 +507,6 @@ def chat_completion_gemini(model, conv, temperature, max_tokens, api_dict=None):
         return output
     except UnboundLocalError:
         return "error"
-
-
-def chat_completion_together(model, conv, temperature, max_tokens, api_dict=None):
-    client = Together(api_key=os.environ["TOGETHER_API_KEY"])
-    output = API_ERROR_OUTPUT
-    for _ in range(API_MAX_RETRY):
-        try:
-            messages = conv.to_openai_api_messages()
-            response = client.chat.completions.create(
-                model=model, messages=messages, n=1, temperature=temperature, max_tokens=max_tokens
-            )
-            output = response.choices[0].message.content
-            break
-        # except any exception
-        except Exception as e:
-            print(f"Failed to connect to Together API: {e}")
-            time.sleep(API_RETRY_SLEEP)
-    return output
 
 
 def chat_completion_openai(model, conv, temperature, max_tokens, api_dict=None):

@@ -25,7 +25,7 @@ import logging
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import json
 import numpy as np
 from fastchat.conversation import get_conv_template
 from transformers import AutoTokenizer
@@ -104,20 +104,27 @@ def get_args():
         default="Qwen/Qwen2-72B-Instruct",
         help="Aggregator model for MoA",
     )
+    parser.add_argument(
+        "--evaluation_style",
+        type=str,
+        default="score",
+        choices=["binary", "score"],
+        help="Evaluation style: binary (A/B) or score-based (1-5)",
+    )
     args = parser.parse_args()
     
     args.do_not_save = True
     args.force_local = True
-    #args.debug = True
-    args.debug = False
+    args.debug = True
+    #args.debug = False
     args.moa = True
     #args.moa = False
 
     args.num_gpus = 2
 
-    # args.num_threads = 1
+    args.num_threads = 1
     args.reference_models =["microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat", "Qwen/Qwen2-72B-Instruct", "meta-llama/Llama-3-70b-chat-hf", "mistralai/Mixtral-8x22B-Instruct-v0.1", "databricks/dbrx-instruct"]
-    #args.reference_models =["microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat"]
+    args.reference_models =["microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat"]
     args.aggregator_model = "Qwen/Qwen2-72B-Instruct"
     args.model = "prometheus-eval/prometheus-7b-v2.0"
     #args.model = "meta-llama/Meta-Llama-3-8B-Instruct"
@@ -205,7 +212,7 @@ def main():
 
     # debug: use only a few examples
     if args.debug:
-        debug_size = 100
+        debug_size = 1
         dataset = dataset.select(range(debug_size))
         subsets = subsets[:debug_size]
         ids = ids[:debug_size]
@@ -220,7 +227,50 @@ def main():
             sys.stdout.write("\r[{}{}] {}/{}".format("#" * progress, "." * (50 - progress), done, total))
             sys.stdout.flush()
 
-        def get_judgement(batch, debug=args.debug):
+        def save_detailed_results(example_index, prompt, answer_a, answer_b, winner, judgement, args, is_shuffled):
+            detailed_results = {
+                "example": {
+                    "user_query": prompt,
+                    "response_1": answer_a[1]["content"],
+                    "response_2": answer_b[1]["content"]
+                },
+                "reference_models": [],
+                "aggregator": None,
+                "final_preference": 1 if winner == "A" else (0 if winner == "B" else 0.5),
+                "gold_preference": 1 if not is_shuffled else 0
+            }
+
+            if args.moa:
+                reference_judgments, aggregator_judgment = judgement
+                for model, judgment in zip(args.reference_models, reference_judgments):
+                    detailed_results["reference_models"].append({
+                        "model": model,
+                        "output": judgment
+                    })
+                detailed_results["aggregator"] = {
+                    "model": args.aggregator_model,
+                    "output": aggregator_judgment
+                }
+            else:
+                if isinstance(args.model, list):
+                    for model, judgment in zip(args.model, judgement):
+                        detailed_results["reference_models"].append({
+                            "model": model,
+                            "output": judgment
+                        })
+                else:
+                    detailed_results["reference_models"].append({
+                        "model": args.model,
+                        "output": judgement
+                    })
+
+            os.makedirs("/usr/project/xtmp/rx55/projects/moa-eval/results/rewardBench/moa", exist_ok=True)
+            with open(f"/usr/project/xtmp/rx55/projects/moa-eval/results/rewardBench/moa/example_{example_index}_results.json", "w") as f:
+                json.dump(detailed_results, f, indent=2)
+                
+                
+        # Modify the get_judgement function to call save_detailed_results
+        def get_judgement(example_index, batch, debug=args.debug):
             mult_turn = True if len(batch["text_chosen"]) > 2 else False
             prompt = batch["text_chosen"][0]["content"]
             answer_a = batch["text_chosen"]
@@ -239,7 +289,7 @@ def main():
             if len(batch["text_chosen"]) <= 4:  # set up only for 1 or 2 turns
                 winner, request, judgement = run_judge_pair(
                     prompt, answer_a, answer_b, args.model, multi_turn=mult_turn, 
-                    model_modifier=model_modifier, use_moa=args.moa
+                    model_modifier=model_modifier, use_moa=args.moa, evaluation_style=args.evaluation_style
                 )
                 if debug:
                     print(f"Prompt: {request}")
@@ -250,6 +300,9 @@ def main():
                     if debug:
                         print(winner)
                     winner = max(set(winner), key=winner.count)
+
+                # Save detailed results
+                save_detailed_results(example_index, prompt, answer_a, answer_b, winner, judgement, args, is_shuffled)
 
                 if winner == winner_text:
                     return 1
@@ -270,7 +323,7 @@ def main():
 
             with ThreadPoolExecutor(max_workers=args.num_threads) as executor:
                 # Submit all tasks and hold their futures in a list
-                future_to_index = {executor.submit(get_judgement, x): i for i, x in enumerate(dataset)}
+                future_to_index = {executor.submit(get_judgement, i, x): i for i, x in enumerate(dataset)}
 
                 # As tasks complete, update progress and store results in the original order
                 for future in as_completed(future_to_index):
