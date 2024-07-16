@@ -30,7 +30,7 @@ import numpy as np
 from fastchat.conversation import get_conv_template
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
-
+from collections import Counter
 from rewardbench import load_eval_dataset, save_to_hub
 from rewardbench.constants import EXAMPLE_COUNTS, SUBSET_MAPPING
 from rewardbench.generative import (
@@ -43,6 +43,8 @@ from rewardbench.generative import (
     run_judge_pair,
 )
 from rewardbench.utils import calculate_scores_per_section
+from collections import Counter
+from datasets import Dataset
 
 # get token from HF_TOKEN env variable, but if it doesn't exist pass none
 HF_TOKEN = os.getenv("HF_TOKEN", None)
@@ -52,6 +54,106 @@ if HF_TOKEN is not None:
 
     _login(token=HF_TOKEN, add_to_git_credential=False)
 
+def fix_seed(seed: int = 0):
+    np.random.seed(seed)
+    # random.seed(seed)
+
+def get_judgement(example_id, batch, args):
+    mult_turn = True if len(batch["text_chosen"]) > 2 else False
+    prompt = batch["text_chosen"][0]["content"]
+    answer_a = batch["text_chosen"]
+    answer_b = batch["text_rejected"]
+
+    # shuffle a and b randomly for position bias
+    is_shuffled = np.random.rand() > 0.5
+    if is_shuffled:
+        answer_a, answer_b = answer_b, answer_a
+
+    if len(batch["text_chosen"]) <= 4:  # set up only for 1 or 2 turns
+        answer = {'A': answer_a, 'B': answer_b}
+        winner, request, judgement = run_judge_pair(
+            prompt, answer, args.model, multi_turn=mult_turn, 
+            model_modifier=args.model_modifier, use_moa=args.moa,
+            evaluation_style=args.evaluation_style, debug=args.debug, temperature=args.temperature
+        )
+
+        # handle voting for PoLL
+        if isinstance(winner, list) and not args.moa:
+            if args.debug:
+                print(winner)
+            winner = max(set(winner), key=winner.count)
+        
+        # Save detailed results
+        detailed_results = save_detailed_results(example_id, prompt, answer_a, answer_b, winner, judgement, args, is_shuffled)
+
+        # Process the result
+        processed_result = process_json_result(detailed_results, args.evaluation_style)
+        
+        return processed_result, detailed_results
+    else:
+        return 0.5, {"final_preference": 0.5, "gold_preference": 0.5, "example": {"id": example_id}}
+
+
+def process_result(winner, winner_text, loser_text):
+    if winner == winner_text:
+        return 1
+    elif winner == loser_text:
+        return 0
+    else:  # if "error" or tie
+        return 0.5  # effectively a tie
+
+def process_json_result(json_data, evaluation_style="binary"):
+    if 'aggregator' in json_data and json_data['aggregator']:
+        # MoA case
+        aggregator_judgment = json_data['aggregator']['output']
+    elif 'reference_models' in json_data and json_data['reference_models']:
+        # Single model case
+        aggregator_judgment = json_data['reference_models'][0]['output']
+    else:
+        # If neither aggregator nor reference_models are present, return an error
+        return 0.5  # Treat as a tie/error case
+
+    winner = process_judgement(aggregator_judgment, evaluation_style=evaluation_style)
+    
+    # Determine winner_text and loser_text based on gold_preference
+    gold_preference = json_data.get('gold_preference', 0.5)  # Default to 0.5 if not present
+    if gold_preference == 1:
+        winner_text = "A"
+        loser_text = "B"
+    elif gold_preference == 0:
+        winner_text = "B"
+        loser_text = "A"
+    else:
+        # If gold_preference is 0.5 or invalid, treat as a tie
+        return 0.5
+
+    return process_result(winner, winner_text, loser_text)
+
+def load_existing_results(args, folder_name, evaluation_style=None):
+    if evaluation_style:
+        output_folder = os.path.join(args.output_dir, folder_name, evaluation_style)
+    else:
+        output_folder = os.path.join(args.output_dir, folder_name)
+    
+    existing_results = {}
+    if os.path.exists(output_folder):
+        json_files = [f for f in os.listdir(output_folder) if f.endswith("_results.json")]
+        for file in json_files:
+            try:
+                with open(os.path.join(output_folder, file), 'r') as f:
+                    data = json.load(f)
+                    example_id = int(file.split("_")[0])
+                    existing_results[example_id] = process_json_result(data, args.evaluation_style)
+            except json.JSONDecodeError:
+                print(f"Error decoding JSON in file: {file}")
+            except Exception as e:
+                print(f"Error processing file {file}: {str(e)}")
+    return existing_results
+
+def update_progress_bar(done, total):
+    progress = int(50 * done / total)
+    sys.stdout.write("\r[{}{}] {}/{}".format("#" * progress, "." * (50 - progress), done, total))
+    sys.stdout.flush()
 
 
 def get_args():
@@ -79,6 +181,9 @@ def get_args():
         "--debug", action="store_true", help="run on common preference sets instead of our custom eval set"
     )
     parser.add_argument(
+        "--subset", action="store_true", help="run only on a subset of the data for debugging purposes"
+    )
+    parser.add_argument(
         "--num_threads", type=int, default=10, help="number of threads to use for parallel processing of examples"
     )
     parser.add_argument(
@@ -87,6 +192,9 @@ def get_args():
     parser.add_argument(
         "--force_local", action="store_true", default=False, help="force local run, even if model is on Together API"
     )
+    parser.add_argument(
+        "--temperature", type=float, default=0, help="temperature for sampling (0 for greedy decoding)"
+    )   
     parser.add_argument(
         "--moa",
         action="store_true",
@@ -107,33 +215,64 @@ def get_args():
     parser.add_argument(
         "--evaluation_style",
         type=str,
-        default="score",
+        default="binary",
         choices=["binary", "score"],
         help="Evaluation style: binary (A/B) or score-based (1-5)",
+    )
+    parser.add_argument(
+        "--single_proposer", action="store_true", help="Use single proposer for MoA",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="/usr/project/xtmp/rx55/projects/moa-eval/results/rewardBench/",
+        help="Base output directory for saving results"
     )
     args = parser.parse_args()
     
     args.do_not_save = True
     args.force_local = True
-    args.debug = True
-    #args.debug = False
-    args.moa = True
-    #args.moa = False
+    #args.debug = True # False or True
+    #args.moa = True # False or True
+    #args.subset = True # False or True
+    # args.single_proposer = True
 
     args.num_gpus = 2
-
-    args.num_threads = 1
+    #args.num_threads = 1
     args.reference_models =["microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat", "Qwen/Qwen2-72B-Instruct", "meta-llama/Llama-3-70b-chat-hf", "mistralai/Mixtral-8x22B-Instruct-v0.1", "databricks/dbrx-instruct"]
-    args.reference_models =["microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat"]
-    args.aggregator_model = "Qwen/Qwen2-72B-Instruct"
-    args.model = "prometheus-eval/prometheus-7b-v2.0"
+    # args.reference_models =["microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat"]
+    #args.aggregator_model = "Qwen/Qwen2-72B-Instruct"
+    
+    args.reference_models =["microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat", "Qwen/Qwen2-72B-Instruct", "meta-llama/Llama-3-70b-chat-hf", "mistralai/Mixtral-8x22B-Instruct-v0.1", "databricks/dbrx-instruct"]
+    args.aggregator_model = "Qwen/Qwen1.5-110B-Chat"
+    
+    
+    if args.debug:
+        args.reference_models =["Qwen/Qwen1.5-0.5B-Chat"]
+        args.aggregator_model = "Qwen/Qwen1.5-0.5B-Chat"
+
+    if args.single_proposer:
+        args.reference_models = ["meta-llama/Llama-3-70b-chat-hf","meta-llama/Llama-3-70b-chat-hf","meta-llama/Llama-3-70b-chat-hf","meta-llama/Llama-3-70b-chat-hf","meta-llama/Llama-3-70b-chat-hf","meta-llama/Llama-3-70b-chat-hf"]
+        args.aggregator_model = "Qwen/Qwen1.5-110B-Chat"
+        args.temperature = 1
+
+
+    args.model = "meta-llama/Llama-3-70b-chat-hf"
+    args.model = "Qwen/Qwen2-72B-Instruct"
+    args.model = "Qwen/Qwen1.5-110B-Chat"
+
     #args.model = "meta-llama/Meta-Llama-3-8B-Instruct"
     #args.model = "meta-llama/Llama-3-8b-chat-hf"
+     
     
     return args
 
 
+
+
 def main():
+    
+    fix_seed(0)
     args = get_args()
     ###############
     # Setup logging
@@ -196,27 +335,61 @@ def main():
     # Load dataset
     ############################
     logger.info("*** Load dataset ***")
+    logger.info(f"*** Evaluation style: {args.evaluation_style} ***")
+
+
     dataset, subsets = load_eval_dataset(
         core_set=not args.pref_sets,
         conv=get_conv_template("raw"),  # not used in this script (handled later)
         custom_dialogue_formatting=True,  # handle formatting later
         tokenizer=None,
         logger=logger,
-        keep_columns=["text_chosen", "text_rejected", "id"],
+        keep_columns=["text_chosen", "text_rejected", "id", "subset"],
         max_turns=4,
     )
 
     # copy id for saving, then remove
     ids = dataset["id"]
-    dataset = dataset.remove_columns("id")
 
-    # debug: use only a few examples
+    # Debug: select a few examples from each subset
+    if args.subset:
+        debug_size = 25
+        debug_indices = []
+        
+        unique_subsets = set(subsets)
+        for subset in unique_subsets:
+            subset_indices = [i for i, s in enumerate(subsets) if s == subset]
+            selected_indices = subset_indices[:debug_size]
+            debug_indices.extend(selected_indices)
+        
+        # Use the select method to create a new dataset with the debug indices
+        dataset = dataset.select(debug_indices)
+        subsets = [subsets[i] for i in debug_indices]
+        ids = [ids[i] for i in debug_indices]
+        logger.info(f"Dataset size after selection: {len(dataset)}")
+        logger.info(f"Number of examples per subset: {Counter(subsets)}")
+
     if args.debug:
+        # debug_size = 1
+        # dataset = dataset.select(range(debug_size))
+        # subsets = subsets[:debug_size]
+        # ids = ids[:debug_size]
         debug_size = 1
-        dataset = dataset.select(range(debug_size))
-        subsets = subsets[:debug_size]
-        ids = ids[:debug_size]
-
+        debug_indices = []
+        
+        unique_subsets = set(subsets)
+        for subset in unique_subsets:
+            subset_indices = [i for i, s in enumerate(subsets) if s == subset]
+            selected_indices = subset_indices[:debug_size]
+            debug_indices.extend(selected_indices)
+        
+        # Use the select method to create a new dataset with the debug indices
+        dataset = dataset.select(debug_indices)
+        subsets = [subsets[i] for i in debug_indices]
+        ids = [ids[i] for i in debug_indices]
+    
+        logger.info(f"Dataset size after debug selection: {len(dataset)}")
+        
     if is_api_models:
         ############################
         # Run inference via API
@@ -226,13 +399,14 @@ def main():
             progress = int(50 * done / total)  # Calculate progress (50 chars width)
             sys.stdout.write("\r[{}{}] {}/{}".format("#" * progress, "." * (50 - progress), done, total))
             sys.stdout.flush()
-
-        def save_detailed_results(example_index, prompt, answer_a, answer_b, winner, judgement, args, is_shuffled):
+            
+        def save_detailed_results(example_id, prompt, answer_a, answer_b, winner, judgement, args, is_shuffled):
             detailed_results = {
                 "example": {
+                    "id": example_id,
                     "user_query": prompt,
-                    "response_1": answer_a[1]["content"],
-                    "response_2": answer_b[1]["content"]
+                    "response_a": answer_a[1]["content"],
+                    "response_b": answer_b[1]["content"]
                 },
                 "reference_models": [],
                 "aggregator": None,
@@ -243,14 +417,26 @@ def main():
             if args.moa:
                 reference_judgments, aggregator_judgment = judgement
                 for model, judgment in zip(args.reference_models, reference_judgments):
-                    detailed_results["reference_models"].append({
-                        "model": model,
-                        "output": judgment
-                    })
+                    if args.evaluation_style == "binary":
+                        detailed_results["reference_models"].append({
+                            "model": model,
+                            "output": judgment
+                        })
+                    else:  # score-based
+                        judgment_a, judgment_b = judgment
+                        detailed_results["reference_models"].append({
+                            "model": model,
+                            "output_a": judgment_a,
+                            "output_b": judgment_b
+                        })
                 detailed_results["aggregator"] = {
                     "model": args.aggregator_model,
                     "output": aggregator_judgment
                 }
+                
+                # MoA-specific folder structure
+                folder_name = f"moa_{len(args.reference_models)}ref_{args.aggregator_model.split('/')[-1]}"
+                output_folder = os.path.join(args.output_dir, folder_name, args.evaluation_style)
             else:
                 if isinstance(args.model, list):
                     for model, judgment in zip(args.model, judgement):
@@ -258,19 +444,27 @@ def main():
                             "model": model,
                             "output": judgment
                         })
+                    # PoLL-specific folder structure
+                    folder_name = f"poll_{len(args.model)}models"
                 else:
                     detailed_results["reference_models"].append({
                         "model": args.model,
                         "output": judgement
                     })
+                    # Single model folder structure
+                    folder_name = f"single_{args.model.split('/')[-1]}"
+                
+                output_folder = os.path.join(args.output_dir, folder_name)
 
-            os.makedirs("/usr/project/xtmp/rx55/projects/moa-eval/results/rewardBench/moa", exist_ok=True)
-            with open(f"/usr/project/xtmp/rx55/projects/moa-eval/results/rewardBench/moa/example_{example_index}_results.json", "w") as f:
+            os.makedirs(output_folder, exist_ok=True)
+            file_name = f"{example_id}_results.json"
+            with open(os.path.join(output_folder, file_name), "w") as f:
                 json.dump(detailed_results, f, indent=2)
-                
-                
-        # Modify the get_judgement function to call save_detailed_results
-        def get_judgement(example_index, batch, debug=args.debug):
+
+            return detailed_results
+        
+
+        def get_judgement(example_id, batch, debug=args.debug):
             mult_turn = True if len(batch["text_chosen"]) > 2 else False
             prompt = batch["text_chosen"][0]["content"]
             answer_a = batch["text_chosen"]
@@ -287,32 +481,30 @@ def main():
                 loser_text = "B"
 
             if len(batch["text_chosen"]) <= 4:  # set up only for 1 or 2 turns
+                answer = {'A': answer_a, 'B': answer_b}
                 winner, request, judgement = run_judge_pair(
-                    prompt, answer_a, answer_b, args.model, multi_turn=mult_turn, 
-                    model_modifier=model_modifier, use_moa=args.moa, evaluation_style=args.evaluation_style
+                    prompt, answer, args.model, multi_turn=mult_turn, 
+                    model_modifier=model_modifier, use_moa=args.moa,
+                    evaluation_style=args.evaluation_style, debug=args.debug, temperature=args.temperature
                 )
-                if debug:
-                    print(f"Prompt: {request}")
-                    print(f"Judgement: {judgement}")
 
                 # handle voting for PoLL
                 if isinstance(winner, list) and not args.moa:
                     if debug:
                         print(winner)
                     winner = max(set(winner), key=winner.count)
+                
+                # Save detailed results for both MoA and non-MoA cases
+                detailed_results = save_detailed_results(example_id, prompt, answer_a, answer_b, winner, judgement, args, is_shuffled)
 
-                # Save detailed results
-                save_detailed_results(example_index, prompt, answer_a, answer_b, winner, judgement, args, is_shuffled)
-
-                if winner == winner_text:
-                    return 1
-                elif winner == loser_text:
-                    return 0
-                else:  # if "error"
-                    return 0.5  # effectively a tie
+                # Process the result
+                processed_result = process_result(detailed_results['final_preference'], detailed_results['gold_preference'])
+                
+                return processed_result, detailed_results
             else:
-                return 0.5
-
+                return 0.5, {"final_preference": 0.5, "gold_preference": 0.5, "example": {"id": example_id}}
+            
+ 
         with ThreadPoolExecutor(max_workers=args.num_threads) as executor:
             # Map 'my_function' across the vector, executing in parallel using threads
             # results = list(executor.map(get_judgement, dataset))
@@ -320,20 +512,63 @@ def main():
             # Progress bar version
             results = [None] * len(dataset)  # Preallocate results list
             done_tasks = 0  # Counter for completed tasks
+            
+            if args.moa:
+                folder_name = f"moa_{len(args.reference_models)}ref_{args.aggregator_model.split('/')[-1]}"
+                output_folder = os.path.join(args.output_dir, folder_name, args.evaluation_style)
+            elif isinstance(args.model, list):
+                folder_name = f"poll_{len(args.model)}models"
+                output_folder = os.path.join(args.output_dir, folder_name)
+            else:
+                folder_name = f"single_{args.model.split('/')[-1]}"
+                output_folder = os.path.join(args.output_dir, folder_name)
 
+            os.makedirs(output_folder, exist_ok=True)
+
+            # Load existing results
+            if args.moa:
+                folder_name = f"moa_{len(args.reference_models)}ref_{args.aggregator_model.split('/')[-1]}"
+                existing_results = load_existing_results(args, folder_name, args.evaluation_style)
+            else:
+                folder_name = f"single_{args.model.split('/')[-1]}" if not isinstance(args.model, list) else f"poll_{len(args.model)}models"
+                existing_results = load_existing_results(args, folder_name)
+
+            # Create a set of IDs for quick lookup
+            existing_ids = set(existing_results.keys())
+
+            # Create lists to store results and processed IDs
+            results = []
+            processed_ids = []
+            all_detailed_results = {}
+            
+            # Process existing results
+            for i, example in enumerate(dataset):
+                if example['id'] in existing_ids:
+                    result = existing_results[example['id']]
+                    results.append(result)
+                    processed_ids.append(i)
+                    all_detailed_results[example['id']] = result
+
+            # Determine which examples need to be processed
+            new_examples = [ex for i, ex in enumerate(dataset) if i not in processed_ids]
+
+            done_tasks = len(existing_results)
+            update_progress_bar(done_tasks, len(dataset))
+
+            # Process new examples
             with ThreadPoolExecutor(max_workers=args.num_threads) as executor:
-                # Submit all tasks and hold their futures in a list
-                future_to_index = {executor.submit(get_judgement, i, x): i for i, x in enumerate(dataset)}
+                future_to_index = {executor.submit(get_judgement, ex['id'], ex, args): i for i, ex in enumerate(new_examples)}
 
-                # As tasks complete, update progress and store results in the original order
                 for future in as_completed(future_to_index):
                     index = future_to_index[future]
-                    results[index] = future.result()
+                    processed_result, detailed_result = future.result()
+                    results.append(processed_result)
+                    all_detailed_results[detailed_result['example']['id']] = detailed_result
                     done_tasks += 1
                     update_progress_bar(done_tasks, len(dataset))
 
             # Print newline after progress bar
-            print()
+            print()  
     else:
         ############################
         # Run model weights with vllm
@@ -413,8 +648,8 @@ def main():
     out_dataset = dataset.add_column("results", results)
 
     # add subsets back (removed so it's not handled by cuda)
-    out_dataset = out_dataset.add_column("subset", subsets)
-    out_dataset = out_dataset.add_column("id", ids)
+    #out_dataset = out_dataset.add_column("subset", subsets) 
+    #out_dataset = out_dataset.add_column("id", ids)
 
     # model name concat if list
     if isinstance(args.model, list):
@@ -451,11 +686,26 @@ def main():
         print(f"{subset}: {num_correct}/{num_total} ({num_correct/num_total})")
         results_grouped[subset] = num_correct / num_total
 
+    logger.info(f"*** Evaluation style: {args.evaluation_style} ***")
+    if args.moa:
+        logger.info(f"Reference models {args.reference_models}, Aggregator model {args.aggregator_model}")
+    else:
+        logger.info(f"Model: {model_name}")
+
     # log leaderboard aggregated results
     if not args.pref_sets:
-        results_leaderboard = calculate_scores_per_section(EXAMPLE_COUNTS, SUBSET_MAPPING, results_grouped)
-        print(results_leaderboard)
-
+        if args.debug or args.subset:
+            results_leaderboard = calculate_scores_per_section(EXAMPLE_COUNTS, SUBSET_MAPPING, results_grouped, equal_counts=True)
+        else:
+            results_leaderboard = calculate_scores_per_section(EXAMPLE_COUNTS, SUBSET_MAPPING, results_grouped)
+            
+        average = sum(results_leaderboard.values()) / len(results_leaderboard)
+        print("Average", round(average*100, 1), end="  ")
+        # print the key and value, value is rounded to 2 decimal places
+        for key, value in results_leaderboard.items():
+            print(key, round(value*100, 1), end="  ")
+        print()
+            
     ############################
     # Upload results to hub
     #############################

@@ -59,7 +59,7 @@ OPENAI_MODEL_LIST = (
 
 # feel free to add more models to this list via PR
 # available models: https://docs.together.ai/docs/inference-models
-TOGETHER_MODEL_LIST = ("meta-llama/Llama-3-70b-chat-hf", "meta-llama/Llama-3-8b-chat-hf", "microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat", "Qwen/Qwen2-72B-Instruct", "mistralai/Mixtral-8x22B-Instruct-v0.1", "databricks/dbrx-instruct", "Qwen/Qwen2-72B-Instruct" )
+TOGETHER_MODEL_LIST = ("meta-llama/Llama-3-70b-chat-hf", "meta-llama/Llama-3-8b-chat-hf", "microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat", "Qwen/Qwen2-72B-Instruct", "mistralai/Mixtral-8x22B-Instruct-v0.1", "databricks/dbrx-instruct", "Qwen/Qwen2-72B-Instruct","Qwen/Qwen1.5-0.5B-Chat" )
 
 GEMINI_MODEL_LIST = ("gemini-1.5-flash-001", "gemini-1.5-pro-001")
 
@@ -105,7 +105,7 @@ prompt_multi_v2 = (
     "factors such as the helpfulness, relevance, accuracy, depth, creativity, and level of detail of their responses. Begin your evaluation by "  # noqa
     "comparing the two responses and provide a short explanation. Avoid any position biases and ensure that the order in which the responses were "  # noqa
     "presented does not influence your decision. Do not allow the length of the responses to influence your evaluation. Do not favor certain names "  # noqa
-    "of the assistants. Be as objective as possible. After providing your explanation, output your final verdict by strictly following this format: "  # noqa
+    "of the assistants. Be as objective as possible. After providing your explanation, output your decision by strictly following this format: "  # noqa
     '"[[A]]" if assistant A is better, "[[B]]" if assistant B is better.'  # noqa, removed tie option as , and \"[[C]]\" for a tie
 )
 
@@ -207,20 +207,17 @@ Response to evaluate:
 Provide a explanation of your evaluation and then output your score strictly in the following format: [SCORE: X] where X is the numeric score (1-5).
 """
 
-SCORE_BASED_AGGREGATOR_PROMPT = """
-As an impartial meta-judge, your task is to synthesize evaluations from multiple evaluators regarding the performance of two AI assistants (A and B) in response to a user query. Each evaluator has provided a score from 1 to 5 for each assistant's response. Your goal is to produce a single, high-quality judgment that determines which assistant provided the better response based on these scores.
+AGGREGATOR_PROMPT = """Given the user query, AI assistant's responses, and judgments from multiple evaluators, your task is to carefuly evaluate each judgment and synthesize them into a final, authoritative decision. It is crucial to critically evaluate the information provided from the evaluators, recognizing that some of it may be biased or incorrect. Your synthesized judgment should not simply replicate the given judgments. Instead, offer a refined, well-reasoned decision that represents the most accurate and reliable evaluation of the AI assistants' response to the user query. Ensure your decision is well-structured and adheres to the highest standards of impartiality and analytical rigor. Explain your reasoning process and provide a final verdict by strictly following this format: "[[A]]" if assistant A is better, "[[B]]" if assistant B is better.
 
 User query: {question}
 
-Evaluations:
-{evaluations}
+Assistant A response: {answer_a}
 
-Analyze the scores and explanations provided by the evaluators. Consider any patterns or discrepancies in the scoring. Provide a brief synthesis of the evaluations, explaining which assistant seems to have performed better overall and why.
+Assistant B response: {answer_b}
 
-Then, provide your final verdict using the following format:
-[[A]] if assistant A is better, or [[B]] if assistant B is better.
+Judgments from evaluators:
+{judgments_formatted}
 
-In case of a tie in average scores, use your judgment based on the qualitative feedback to break the tie.
 """
 
 # format with prompt_template.format(question=question, answer_a=answer_a, answer_b=answer_b)
@@ -267,44 +264,14 @@ def format_judge_answers(question, answer_a, answer_b, multi_turn=False, model_m
     return system_prompt, user_prompt
 
 
-def process_judgement(judgment, is_prometheus=False, evaluation_style="binary"):
-    if isinstance(judgment, tuple):  # MoA case
-        _, aggregator_judgment = judgment
-        judgment = aggregator_judgment
-    
-    if evaluation_style == "binary":
-        if is_prometheus:
-            if "[RESULT]" in judgment:
-                if judgment[-1] == "A":
-                    return "A"
-                elif judgment[-1] == "B":
-                    return "B"
-                else:
-                    return "error"
-            else:
-                return "error"
-        else:
-            if "[[A]]" in judgment:
-                return "A"
-            elif "[[B]]" in judgment:
-                return "B"
-            else:
-                return "error"
-    else:  # score-based
-        if isinstance(judgment, tuple):  # Single model case
-            score_a = int(judgment[0].split("[SCORE: ")[1].split("]")[0])
-            score_b = int(judgment[1].split("[SCORE: ")[1].split("]")[0])
-            return "A" if score_a > score_b else "B" if score_b > score_a else "error"
-        else:  # Aggregator case
-            if "[[A]]" in judgment:
-                return "A"
-            elif "[[B]]" in judgment:
-                return "B"
-            else:
-                return "error"
 
-# noqa adapted from FastChat https://github.com/lm-sys/FastChat/blob/b015f21cb9d0cf3c87d2a5e53008074c537e8be0/fastchat/llm_judge/common.py#L235C1-L312C1
-def get_model_completion(model, prompt, system_prompt="", temperature=1, max_tokens=1):
+def get_model_completion(model, prompt, system_prompt="", debug=False, temperature=0.0, max_tokens=2048):
+    if debug:
+        temperature = 0
+        max_tokens = 1
+        prompt = "Hello"
+        system_prompt = "Hello"
+        
     """Helper function to get completion from different model types."""
     if model in OPENAI_MODEL_LIST:
         template = "chatgpt"
@@ -333,26 +300,62 @@ def get_model_completion(model, prompt, system_prompt="", temperature=1, max_tok
     else:
         raise ValueError(f"Model {model} not supported")
 
-def run_judge_pair(question, answer_a, answer_b, model, multi_turn=False, model_modifier=None, use_moa=False, evaluation_style="binary"):
+
+def process_judgement(judgment, is_prometheus=False, evaluation_style="binary"):
+    if isinstance(judgment, tuple):  # MoA case
+        _, aggregator_judgment = judgment
+        judgment = aggregator_judgment
+    
     if evaluation_style == "binary":
-        system_prompt, user_prompt = format_judge_answers(
-            question, answer_a, answer_b, multi_turn, model_modifier=model_modifier
-        )
+        if is_prometheus:
+            if "[RESULT]" in judgment:
+                if judgment[-1] == "A":
+                    return "A"
+                elif judgment[-1] == "B":
+                    return "B"
+                else:
+                    return "error"
+            else:
+                return "error"
+        else:
+            if "[[A]]" in judgment:
+                return "A"
+            elif "[[B]]" in judgment:
+                return "B"
+            else:
+                return "error"
     else:  # score-based
+        if isinstance(judgment, tuple):  # Comparison case
+            score_a = float(judgment[0].split("[SCORE: ")[1].split("]")[0])
+            score_b = float(judgment[1].split("[SCORE: ")[1].split("]")[0])
+            return "A" if score_a > score_b else "B" if score_b > score_a else "error"
+        else:  # Single response case or Aggregator case
+            if "[SCORE: " in judgment:  # Single response case
+                return float(judgment.split("[SCORE: ")[1].split("]")[0])
+            elif "[[A]]" in judgment:  # Aggregator case
+                return "A"
+            elif "[[B]]" in judgment:
+                return "B"
+            else:
+                return "error"
+            
+# noqa adapted from FastChat https://github.com/lm-sys/FastChat/blob/b015f21cb9d0cf3c87d2a5e53008074c537e8be0/fastchat/llm_judge/common.py#L235C1-L312C1
+def run_judge_pair(question, answer, model, multi_turn=False, model_modifier=None, use_moa=False, evaluation_style="binary", is_comparison=True, debug=False, temperature=0.0):
+    if evaluation_style == "binary" and is_comparison:
+        system_prompt, user_prompt = format_judge_answers(
+            question, answer['A'], answer['B'], multi_turn, model_modifier=model_modifier
+        )
+    else:  # score-based or single answer evaluation
         system_prompt = ""
         user_prompt = SCORE_BASED_REFERENCE_PROMPT
 
-    winner = "error"
-
     # Handle multi-model (ensembles) recursively, not MoA
     if isinstance(model, list) and not use_moa:
-        winners = []
         judgments = []
         for m in model:
-            winner, _, judgment = run_judge_pair(question, answer_a, answer_b, m, multi_turn, evaluation_style=evaluation_style)
-            winners.append(winner)
+            _, _, judgment = run_judge_pair(question, answer, m, multi_turn, model_modifier, use_moa, evaluation_style, is_comparison, debug, temperature)
             judgments.append(judgment)
-        return winners, user_prompt, judgments
+        return None, user_prompt, judgments
 
     # Handle MoA approach
     elif isinstance(model, list) and use_moa:
@@ -361,52 +364,40 @@ def run_judge_pair(question, answer_a, answer_b, model, multi_turn=False, model_
         reference_judgments = []
         
         for ref_model in reference_models:
-            if evaluation_style == "binary":
-                _, _, judgment = run_judge_pair(question, answer_a, answer_b, ref_model, multi_turn)
+            if evaluation_style == "binary" and is_comparison:
+                _, _, judgment = run_judge_pair(question, answer, ref_model, multi_turn, model_modifier, False, evaluation_style, is_comparison, debug, temperature)
                 reference_judgments.append(judgment)
             else:  # score-based
-                _, _, judgment_a = run_judge_pair(question, answer_a, None, ref_model, multi_turn, evaluation_style=evaluation_style)
-                _, _, judgment_b = run_judge_pair(question, answer_b, None, ref_model, multi_turn, evaluation_style=evaluation_style)
+                _, _, judgment_a = run_judge_pair(question, {'A': answer['A']}, ref_model, multi_turn, model_modifier, False, evaluation_style, False, debug, temperature)
+                _, _, judgment_b = run_judge_pair(question, {'A': answer['B']}, ref_model, multi_turn, model_modifier, False, evaluation_style, False, debug, temperature)
                 reference_judgments.append((judgment_a, judgment_b))
         
         # Prepare input for aggregator model
         if evaluation_style == "binary":
             judgments_formatted = "\n".join(f"Evaluator {i+1}: {judgment}" for i, judgment in enumerate(reference_judgments))
-            aggregator_prompt = f"""Given a user query and judgments from multiple evaluators, your task is to critically evaluate each judgment and synthesize them into a final, authoritative decision. It is crucial to critically evaluate the information provided from the evaluators, recognizing that some of it may be biased or incorrect. Your synthesized judgment should not simply replicate the given judgments. Instead, offer a refined, well-reasoned decision that represents the most accurate and reliable evaluation of the AI assistants' performances. Ensure your response is well-structured, coherent, and adheres to the highest standards of impartiality and analytical rigor.
-
-User query: {question}
-
-Judgments from evaluators:
-{judgments_formatted}
-
-Explain your reasoning process and provide a final verdict by strictly following this format: "[[A]]" if assistant A is better, "[[B]]" if assistant B is better.
-"""
         else:  # score-based
-            evaluations = []
-            for i, (judgment_a, judgment_b) in enumerate(reference_judgments):
-                evaluations.append(f"Evaluator {i+1}:\nAssistant A: {judgment_a}\nAssistant B: {judgment_b}")
-            judgments_formatted = "\n\n".join(evaluations)
-            aggregator_prompt = SCORE_BASED_AGGREGATOR_PROMPT.format(question=question, evaluations=judgments_formatted)
+            judgments_formatted = "\n".join(f"Evaluator {i+1}:\nAssistant A Evaluation: {judgment_a}\nAssistant B Evaluation: {judgment_b}" for i, (judgment_a, judgment_b) in enumerate(reference_judgments))
         
-        aggregated_system_prompt = """You are an impartial meta-judge tasked with synthesizing evaluations from multiple evaluators regarding the performance of two AI assistants (A and B) in response to a user query. Your goal is to produce a single, high-quality judgment that determines which assistant provided the better response. """
+        aggregated_system_prompt = """You are an impartial meta-judge tasked with synthesizing Judgments from multiple evaluators regarding the performance of two AI assistants (A and B) in response to a user query. Your goal is to produce a single, high-quality judgment that determines which assistant provided the better response."""
+        
+        aggregator_prompt = AGGREGATOR_PROMPT.format(question=question, answer_a=answer['A'][1]["content"], answer_b=answer['B'][1]["content"], judgments_formatted=judgments_formatted)
         
         # Call the aggregator model using the helper function
-        aggregator_judgment = get_model_completion(aggregator_model, aggregator_prompt, aggregated_system_prompt)
+        aggregator_judgment = get_model_completion(aggregator_model, aggregator_prompt, aggregated_system_prompt, debug=debug, temperature=temperature)
         
-        winner = process_judgement(aggregator_judgment, evaluation_style=evaluation_style)
+        winner = process_judgement(aggregator_judgment, evaluation_style="binary")
         return winner, user_prompt, (reference_judgments, aggregator_judgment)
 
     # Handle single model cases
     else:
-        if evaluation_style == "binary":
-            judgment = get_model_completion(model, user_prompt, system_prompt)
-        else:  # score-based
-            judgment_a = get_model_completion(model, user_prompt.format(question=question, response=answer_a[1]["content"]), system_prompt)
-            judgment_b = get_model_completion(model, user_prompt.format(question=question, response=answer_b[1]["content"]), system_prompt)
-            judgment = (judgment_a, judgment_b)
+        if evaluation_style == "binary" and is_comparison:
+            judgment = get_model_completion(model, user_prompt, system_prompt, debug=debug, temperature=temperature)
+        else:  # score-based or single answer evaluation
+            judgment = get_model_completion(model, user_prompt.format(question=question, response=answer['A'][1]["content"]), system_prompt, debug=debug, temperature=temperature)
+        
         winner = process_judgement(judgment, evaluation_style=evaluation_style)
         return winner, user_prompt, judgment
-    
+
 def chat_completion_together(model, conv, temperature, max_tokens, api_dict=None):
     client = Together(api_key=os.environ["TOGETHER_API_KEY"])
     output = API_ERROR_OUTPUT
