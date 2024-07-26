@@ -101,10 +101,27 @@ def get_args():
         help="Use Mixture of Agents approach",
     )
     parser.add_argument(
+        "--three_layer_moa",
+        action="store_true",
+        help="Use three-layer Mixture of Agents approach",
+    )
+    parser.add_argument(
         "--reference_models",
         nargs="+",
         default=["microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat", "Qwen/Qwen2-72B-Instruct", "meta-llama/Llama-3-70b-chat-hf", "mistralai/Mixtral-8x22B-Instruct-v0.1", "databricks/dbrx-instruct"],
         help="List of reference models for MoA",
+    )
+    parser.add_argument(
+        "--intermediate_aggregators",
+        nargs="+",
+        default=[],
+        help="List of intermediate aggregator models for three-layer MoA",
+    )
+    parser.add_argument(
+        "--final_aggregator",
+        type=str,
+        default="",
+        help="Final aggregator model for three-layer MoA",
     )
     parser.add_argument(
         "--aggregator_model",
@@ -133,24 +150,25 @@ def get_args():
         action="store_true",
         help="Use majority voting instead of an aggregator model for MoA",
     )
+ 
     args = parser.parse_args()
     
-    # args.model = "microsoft/WizardLM-2-8x22B"
-    # args.output_dir = "/usr/project/xtmp/rx55/projects/moa-eval/results/rewardBench_v3/microsoft-WizardLM-2-8x22B/temp_0"
+    # args.model = "Qwen/Qwen1.5-110B-Chat"
     # args.temperature = 0
     
     args.evaluation_style = "binary"
     args.do_not_save = True
     args.force_local = True
     # args.debug = True  
-    # args.moa = True # False or True
+    args.moa = True # False or True
     #args.use_majority_vote = True # False or True
     #args.subset = True # False or True
     #args.single_proposer = True
     # args.num_threads = 1
 
     # args.reference_models =["microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat", "Qwen/Qwen2-72B-Instruct", "meta-llama/Llama-3-70b-chat-hf", "google/gemma-2-27b-it", "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"]
-    # args.aggregator_model = "Qwen/Qwen2-72B-Instruct"
+    args.reference_models =["microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat", "Qwen/Qwen2-72B-Instruct", "meta-llama/Llama-3-70b-chat-hf"]
+    args.aggregator_model = "Qwen/Qwen2-72B-Instruct"
 
     #args.reference_models = ['microsoft/WizardLM-2-8x22B', 'Qwen/Qwen1.5-110B-Chat', 'Qwen/Qwen2-72B-Instruct', 'meta-llama/Llama-3-70b-chat-hf', 'mistralai/Mixtral-8x22B-Instruct-v0.1', 'databricks/dbrx-instruct']
     # args.reference_models =["microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat"]
@@ -181,7 +199,7 @@ def get_args():
     #args.model = "Qwen/Qwen1.5-0.5B-Chat"
     #args.model = "meta-llama/Meta-Llama-3-8B-Instruct"
     #args.model = "meta-llama/Llama-3-8b-chat-hf"
-     
+
     return args
 
 def main():
@@ -201,8 +219,16 @@ def main():
 
     if args.moa:
         model_type = "Generative RM MoA"
-        args.model = args.reference_models + [args.aggregator_model]
-        logger.info(f"Running reward models using MoA with reference models {args.reference_models} and aggregator model [{args.aggregator_model}]")
+        if args.three_layer_moa:
+            if not args.reference_models or not args.intermediate_aggregators or not args.final_aggregator:
+                raise ValueError("For three-layer MoA, you must specify reference_models, intermediate_aggregators, and final_aggregator")
+            args.model = args.reference_models + args.intermediate_aggregators + [args.final_aggregator]
+            logger.info(f"Running three-layer MoA with reference models {args.reference_models}, intermediate aggregators {args.intermediate_aggregators}, and final aggregator {args.final_aggregator}")
+        else:
+            if len(args.model) < 2:
+                raise ValueError("For two-layer MoA, you must specify at least one reference model and one aggregator model")
+            logger.info(f"Running two-layer MoA with reference models {args.reference_models} and aggregator model {args.aggregator_model}")
+            args.model = args.reference_models + [args.aggregator_model]
     elif isinstance(args.model, list) and len(args.model) > 1:
         model_type = "Generative RM PoLL"
         assert len(args.model) % 2 == 1, "Number of models for PoLL must be odd"
@@ -290,8 +316,8 @@ def main():
             example_id = batch["id"]  # Get the original ID from the dataset
 
             # shuffle a and b randomly for position bias
-            #is_shuffled = np.random.rand() > 0.5
-            is_shuffled = False
+            is_shuffled = np.random.rand() > 0.5
+            #is_shuffled = False
             
             if is_shuffled:
                 answer_a, answer_b = answer_b, answer_a
