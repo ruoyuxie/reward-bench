@@ -124,12 +124,6 @@ def get_args():
         help="Final aggregator model for three-layer MoA",
     )
     parser.add_argument(
-        "--aggregator_model",
-        type=str,
-        default="Qwen/Qwen2-72B-Instruct",
-        help="Aggregator model for MoA",
-    )
-    parser.add_argument(
         "--evaluation_style",
         type=str,
         default="binary",
@@ -161,31 +155,40 @@ def get_args():
     args.force_local = True
     # args.debug = True  
     args.moa = True # False or True
+    # args.three_layer_moa = True
+    
     #args.use_majority_vote = True # False or True
     #args.subset = True # False or True
     #args.single_proposer = True
     # args.num_threads = 1
 
     # args.reference_models =["microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat", "Qwen/Qwen2-72B-Instruct", "meta-llama/Llama-3-70b-chat-hf", "google/gemma-2-27b-it", "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"]
-    args.reference_models =["microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat", "Qwen/Qwen2-72B-Instruct", "meta-llama/Llama-3-70b-chat-hf"]
-    args.aggregator_model = "Qwen/Qwen2-72B-Instruct"
+    args.reference_models =["microsoft/WizardLM-2-8x22B", "Qwen/Qwen2-72B-Instruct", "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo" ]
+    args.intermediate_aggregators = ["Qwen/Qwen1.5-110B-Chat", "Qwen/Qwen2-72B-Instruct", "google/gemma-2-27b-it"]
+    args.final_aggregator = "Qwen/Qwen2-72B-Instruct"
 
+    args.reference_models =  ['microsoft/WizardLM-2-8x22B', 'Qwen/Qwen1.5-110B-Chat', 'Qwen/Qwen2-72B-Instruct', 'meta-llama/Llama-3-70b-chat-hf']
+
+    # args.reference_models =["Qwen/Qwen1.5-0.5B-Chat"]
+    # args.intermediate_aggregators = ["Qwen/Qwen1.5-0.5B-Chat"]
+    # args.final_aggregator = "Qwen/Qwen1.5-0.5B-Chat"
+    
     #args.reference_models = ['microsoft/WizardLM-2-8x22B', 'Qwen/Qwen1.5-110B-Chat', 'Qwen/Qwen2-72B-Instruct', 'meta-llama/Llama-3-70b-chat-hf', 'mistralai/Mixtral-8x22B-Instruct-v0.1', 'databricks/dbrx-instruct']
     # args.reference_models =["microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat"]
-    #args.aggregator_model = "Qwen/Qwen1.5-110B-Chat"
+    #args.final_aggregator = "Qwen/Qwen1.5-110B-Chat"
     
     # if args.debug:
     #     args.num_threads = 1
     #     args.reference_models =["Qwen/Qwen1.5-0.5B-Chat"]
-    #     args.aggregator_model = "Qwen/Qwen1.5-0.5B-Chat"
+    #     args.final_aggregator = "Qwen/Qwen1.5-0.5B-Chat"
         # args.reference_models =["meta-llama/Llama-3-70b-chat-hf"]
-        # args.aggregator_model = "meta-llama/Llama-3-70b-chat-hf"
+        # args.final_aggregator = "meta-llama/Llama-3-70b-chat-hf"
         # args.reference_models =["microsoft/WizardLM-2-8x22B", "Qwen/Qwen1.5-110B-Chat"]
-        # args.aggregator_model = "Qwen/Qwen2-72B-Instruct"
+        # args.final_aggregator = "Qwen/Qwen2-72B-Instruct"
         
     # if args.single_proposer:
     #     args.reference_models = ["Qwen/Qwen2-72B-Instruct","Qwen/Qwen2-72B-Instruct","Qwen/Qwen2-72B-Instruct","Qwen/Qwen2-72B-Instruct"]
-    #     args.aggregator_model = "Qwen/Qwen2-72B-Instruct"
+    #     args.final_aggregator = "Qwen/Qwen2-72B-Instruct"
     #     args.temperature = 0.7
     #     args.output_dir = "/usr/project/xtmp/rx55/projects/moa-eval/results/rewardBench/single_proposer/"
 
@@ -217,6 +220,9 @@ def main():
     log_level = logging.INFO
     logger.setLevel(log_level)
 
+    if args.three_layer_moa:
+        args.moa = True
+
     if args.moa:
         model_type = "Generative RM MoA"
         if args.three_layer_moa:
@@ -225,10 +231,10 @@ def main():
             args.model = args.reference_models + args.intermediate_aggregators + [args.final_aggregator]
             logger.info(f"Running three-layer MoA with reference models {args.reference_models}, intermediate aggregators {args.intermediate_aggregators}, and final aggregator {args.final_aggregator}")
         else:
+            args.model = args.reference_models + [args.final_aggregator]
             if len(args.model) < 2:
                 raise ValueError("For two-layer MoA, you must specify at least one reference model and one aggregator model")
-            logger.info(f"Running two-layer MoA with reference models {args.reference_models} and aggregator model {args.aggregator_model}")
-            args.model = args.reference_models + [args.aggregator_model]
+            logger.info(f"Running two-layer MoA with reference models {args.reference_models} and aggregator model {args.final_aggregator}")
     elif isinstance(args.model, list) and len(args.model) > 1:
         model_type = "Generative RM PoLL"
         assert len(args.model) % 2 == 1, "Number of models for PoLL must be odd"
@@ -491,7 +497,10 @@ def main():
 
     logger.info(f"*** Evaluation style: {args.evaluation_style} ***")
     if args.moa:
-        logger.info(f"Reference models {args.reference_models}, Aggregator model {args.aggregator_model}")
+        if args.three_layer_moa:
+            logger.info(f"Reference models {args.reference_models}, Intermediate aggregators {args.intermediate_aggregators}, Final aggregator model {args.final_aggregator}")
+        else:
+            logger.info(f"Reference models {args.reference_models}, Aggregator model {args.final_aggregator}")
     else:
         logger.info(f"Model: {model_name}")
 

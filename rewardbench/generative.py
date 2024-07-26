@@ -68,6 +68,9 @@ GEMINI_MODEL_LIST = ("gemini-1.5-flash-001", "gemini-1.5-pro-001")
 
 API_MODEL_LIST = OPENAI_MODEL_LIST + ANTHROPIC_MODEL_LIST + TOGETHER_MODEL_LIST
 
+# temperature variables
+REFERENCE_TEMP = 0.0
+AGGREGATOR_TEMP = 0.7
 
 # API setting constants
 API_MAX_RETRY = 25
@@ -278,7 +281,7 @@ Judgments from evaluators:
 Meta Judgement:
 """
 
-AGGREGATOR_PROMPT_V3="""As a meta-evaluator, your role is to synthesize and critically analyze the judgments provided by multiple evaluators regarding two AI assistants' responses to a user query. Your task is to:
+AGGREGATOR_PROMPT_V3="""As a meta-evaluator, your role is to synthesize and critically analyze the judgments provided by multiple evaluators regarding two AI assistants' responses (A or B) to a user query. Your task is to:
 
 1. Carefully review each evaluator's judgment, including their scoring and reasoning for each criterion, with special attention to challenging scenarios and safety considerations.
 2. Assess the validity and consistency of each evaluator's arguments, particularly for complex, nuanced, or potentially trick queries.
@@ -314,6 +317,56 @@ Evaluator judgments:
 
 Meta Evaluation:"""
 
+
+INTERMEDIATE_AGGREGATOR_PROMPT = """As an expert evaluator, your task is to synthesize multiple evaluations of two AI assistants' responses (A or B) to a user query. Your goal is to provide a comprehensive, high-quality evaluation that captures the essence of all the input evaluations. Consider the following:
+
+1. Carefully review each evaluation, paying attention to the reasoning and criteria used.
+2. Identify common themes, agreements, and disagreements among the evaluations.
+3. Assess the strength of arguments presented in each evaluation.
+4. Consider any potential biases or oversights in the individual evaluations.
+5. Synthesize a final evaluation that:
+   a) Provides a clear comparison of the two AI responses.
+   b) Highlights key strengths and weaknesses of each response.
+   c) Offers a well-reasoned judgment on which response better addresses the user query.
+
+Your synthesized evaluation should be thorough, balanced, and provide clear reasoning for your conclusions. Focus on producing a single, high-quality evaluation that could stand on its own.
+
+User query: {question}
+
+Assistant A response: {answer_a}
+
+Assistant B response: {answer_b}
+
+Individual evaluations:
+{evaluations_formatted}
+
+Synthesized Evaluation:"""
+
+FINAL_AGGREGATOR_PROMPT = """As an expert meta-evaluator, your task is to analyze and synthesize multiple evaluations comparing two AI assistants' responses (A or B) to a user query. Your role is crucial in determining the final assessment. Please consider the following:
+
+1. Carefully review each evaluation, noting their reasoning, criteria, and conclusions.
+2. Assess the consistency and validity of arguments across all evaluations.
+3. Identify any potential biases, errors, or oversights that may have influenced individual evaluations.
+4. Consider the strengths and weaknesses of each AI response as highlighted across all evaluations.
+5. Synthesize a final, comprehensive evaluation that:
+   a) Provides a clear comparison of the two AI responses.
+   b) Addresses any conflicting opinions among the  evaluations.
+   c) Offers a well-reasoned, definitive judgment on which response better addresses the user query.
+
+Your final evaluation should represent the most accurate and reliable assessment possible, based on a critical analysis of all evaluations. It's crucial to provide clear reasoning for your conclusions, especially if you disagree with the majority opinion.
+
+Conclude with your final verdict strictly in this format: "[[A]]" if assistant A is better, or "[[B]]" if assistant B is better.
+
+User query: {question}
+
+Assistant A response: {answer_a}
+
+Assistant B response: {answer_b}
+
+Individual evaluations:
+{evaluations_formatted}
+
+Final Meta-Evaluation:"""
 
 # format with prompt_template.format(question=question, answer_a=answer_a, answer_b=answer_b)
 def format_judge_answers(question, answer_a, answer_b, multi_turn=False, model_modifier=None):
@@ -431,21 +484,34 @@ def process_judgement(judgment, is_prometheus=False, evaluation_style="binary"):
             return score
         except:
             return "error"
-
+        
 def get_result_file_path(example_id, args):
     if args.moa:
-        folder_name = f"moa_{len(args.reference_models)}ref_{args.aggregator_model.split('/')[-1]}"
-        output_folder = os.path.join(args.output_dir, folder_name, args.evaluation_style)
+        if args.three_layer_moa:
+            folder_name = f"moa_3layer_{len(args.reference_models)}ref_{len(args.intermediate_aggregators)}int_{args.final_aggregator.split('/')[-1]}"
+        else:
+            folder_name = f"moa_2layer_{len(args.model) - 1}ref_{args.model[-1].split('/')[-1]}"
+        
+        folder_name += f"_ref_temp{REFERENCE_TEMP}_agg_temp{AGGREGATOR_TEMP}"
+        
+        if args.use_majority_vote:
+            folder_name += "_majority"
+        
     else:
         if isinstance(args.model, list):
             folder_name = f"poll_{len(args.model)}models"
         else:
             folder_name = f"single_{args.model.split('/')[-1]}"
-        output_folder = os.path.join(args.output_dir, folder_name)
+        
+        folder_name += f"_temp{args.temperature}"
     
+    folder_name += f"_{args.evaluation_style}"
+    
+    output_folder = os.path.join(args.output_dir, folder_name)
     return os.path.join(output_folder, f"{example_id}_results.json")
 
 def run_judge_pair(question, answer_a, answer_b, model, multi_turn=False, model_modifier=None, use_moa=False, evaluation_style="binary", debug=False, temperature=0.0, output_dir=None, is_recursive_call=False, is_shuffled=False, example_id=None, args=None):
+
     # Check if result file already exists
     result_file_path = get_result_file_path(example_id, args)
     if os.path.exists(result_file_path) and not is_recursive_call:
@@ -483,8 +549,14 @@ def run_judge_pair(question, answer_a, answer_b, model, multi_turn=False, model_
 
     # Handle MoA approach
     if isinstance(model, list) and use_moa:
-        reference_models = model[:-1]
-        aggregator_model = model[-1]
+        if args.three_layer_moa:
+            reference_models = args.reference_models
+            intermediate_aggregator_models = args.intermediate_aggregators
+            final_aggregator_model = args.final_aggregator
+        else:
+            reference_models = model[:-1]
+            final_aggregator_model = model[-1]
+        
         reference_judgments = []
         
         for ref_model in reference_models:
@@ -495,17 +567,16 @@ def run_judge_pair(question, answer_a, answer_b, model, multi_turn=False, model_
                 else:  # score-based
                     reference_judgments.append((existing_judgment["reference_models"][0]["output_a"], existing_judgment["reference_models"][0]["output_b"]))
             else:
-                # If no existing judgment, call the API (you'll need to implement this part)
+                # If no existing judgment, call the API with REFERENCE_TEMP
                 if evaluation_style == "binary":
-                    _, _, judgment = run_judge_pair(question, answer_a, answer_b, ref_model, multi_turn, model_modifier, False, evaluation_style, debug, temperature, output_dir, True, is_shuffled, example_id, args)
+                    _, _, judgment = run_judge_pair(question, answer_a, answer_b, ref_model, multi_turn, model_modifier, False, evaluation_style, debug, temperature=REFERENCE_TEMP, output_dir=output_dir, is_recursive_call=True, is_shuffled=is_shuffled, example_id=example_id, args=args)
                     reference_judgments.append(judgment)
                 else:  # score-based
-                    judgment_a = get_model_completion(ref_model, SCORE_BASED_REFERENCE_PROMPT_V2.format(criteria=SCORE_BASED_REFERENCE_PROMPT_V2_CRITERIA, question=question, response=answer_a[1]["content"]), "", debug=debug, temperature=temperature)
-                    judgment_b = get_model_completion(ref_model, SCORE_BASED_REFERENCE_PROMPT_V2.format(criteria=SCORE_BASED_REFERENCE_PROMPT_V2_CRITERIA, question=question, response=answer_b[1]["content"]), "", debug=debug, temperature=temperature)
+                    judgment_a = get_model_completion(ref_model, SCORE_BASED_REFERENCE_PROMPT_V2.format(criteria=SCORE_BASED_REFERENCE_PROMPT_V2_CRITERIA, question=question, response=answer_a[1]["content"]), "", debug=debug, temperature=REFERENCE_TEMP)
+                    judgment_b = get_model_completion(ref_model, SCORE_BASED_REFERENCE_PROMPT_V2.format(criteria=SCORE_BASED_REFERENCE_PROMPT_V2_CRITERIA, question=question, response=answer_b[1]["content"]), "", debug=debug, temperature=REFERENCE_TEMP)
                     reference_judgments.append((judgment_a, judgment_b))
 
-        
-        # Calculate majority vote (if needed)
+        # Calculate majority vote
         if args.use_majority_vote:
             if evaluation_style == "binary":
                 votes = [process_judgement(judgment, evaluation_style="binary") for judgment in reference_judgments]
@@ -517,24 +588,25 @@ def run_judge_pair(question, answer_a, answer_b, model, multi_turn=False, model_
         else:
             majority_vote = None
         
-        # Use aggregator model
-        if evaluation_style == "binary":
-            judgments_formatted = "\n".join(f"Evaluator {i+1}: {judgment}" for i, judgment in enumerate(reference_judgments))
-        else:  # score-based
-            judgments_formatted = "\n".join(f"Evaluator {i+1}:\nAssistant A Evaluation: {judgment_a}\nAssistant B Evaluation: {judgment_b}" for i, (judgment_a, judgment_b) in enumerate(reference_judgments))
-
-        aggregated_system_prompt = ""
-        
-        aggregator_prompt = AGGREGATOR_PROMPT_V3.format(criteria=SCORE_BASED_REFERENCE_PROMPT_V2_CRITERIA, question=question, answer_a=answer_a[1]["content"], answer_b=answer_b[1]["content"], judgments_formatted=judgments_formatted)
-        
-        aggregator_judgment = get_model_completion(aggregator_model, aggregator_prompt, aggregated_system_prompt, debug=debug, temperature=0.7)
+        if args.three_layer_moa:
+            # Intermediate aggregation with AGGREGATOR_TEMP
+            intermediate_judgments = []
+            for intermediate_model in intermediate_aggregator_models:
+                intermediate_judgment = aggregate_judgments(reference_judgments, intermediate_model, question, answer_a, answer_b, evaluation_style, debug, temperature=AGGREGATOR_TEMP, is_final=False)
+                intermediate_judgments.append(intermediate_judgment)
+            
+            # Final aggregation with AGGREGATOR_TEMP
+            aggregator_judgment = aggregate_judgments(intermediate_judgments, final_aggregator_model, question, answer_a, answer_b, evaluation_style, debug, temperature=AGGREGATOR_TEMP, is_final=True)
+        else:
+            # Existing two-layer aggregation with AGGREGATOR_TEMP
+            aggregator_judgment = aggregate_judgments(reference_judgments, final_aggregator_model, question, answer_a, answer_b, evaluation_style, debug, temperature=AGGREGATOR_TEMP, is_final=True)
         
         winner = process_judgement(aggregator_judgment, evaluation_style="binary")
         
         if not is_recursive_call:
-            save_detailed_results(example_id, question, answer_a, answer_b, winner, (reference_judgments, aggregator_judgment), majority_vote, args, is_shuffled)
+            save_detailed_results(example_id, question, answer_a, answer_b, winner, (reference_judgments, intermediate_judgments if args.three_layer_moa else None, aggregator_judgment), majority_vote, args, is_shuffled)
         
-        return winner, aggregator_prompt, (reference_judgments, aggregator_judgment, majority_vote)
+        return winner, user_prompt, (reference_judgments, intermediate_judgments if args.three_layer_moa else None, aggregator_judgment, majority_vote)
 
     # Handle single model cases
     else:
@@ -551,6 +623,20 @@ def run_judge_pair(question, answer_a, answer_b, model, multi_turn=False, model_
         
         return winner if evaluation_style == "binary" else None, user_prompt, judgment
 
+def aggregate_judgments(judgments, aggregator_model, question, answer_a, answer_b, evaluation_style, debug, temperature, is_final):
+    if evaluation_style == "binary":
+        evaluations_formatted = "\n\n".join(f"Evaluation {i+1}:\n{judgment}" for i, judgment in enumerate(judgments))
+    else:  # score-based
+        evaluations_formatted = "\n\n".join(f"Evaluation {i+1}:\nAssistant A Evaluation: {judgment_a}\nAssistant B Evaluation: {judgment_b}" for i, (judgment_a, judgment_b) in enumerate(judgments))
+
+    if is_final:
+        aggregator_prompt = FINAL_AGGREGATOR_PROMPT.format(question=question, answer_a=answer_a[1]["content"], answer_b=answer_b[1]["content"], evaluations_formatted=evaluations_formatted)
+    else:
+        aggregator_prompt = INTERMEDIATE_AGGREGATOR_PROMPT.format(question=question, answer_a=answer_a[1]["content"], answer_b=answer_b[1]["content"], evaluations_formatted=evaluations_formatted)
+
+    aggregate_judgement = get_model_completion(aggregator_model, aggregator_prompt, "", debug=debug, temperature=temperature)
+    
+    return aggregate_judgement
 
 def save_detailed_results(example_id, prompt, answer_a, answer_b, winner, judgement, majority_vote, args, is_shuffled):
     detailed_results = {
@@ -561,52 +647,54 @@ def save_detailed_results(example_id, prompt, answer_a, answer_b, winner, judgem
             "response_b": answer_b[1]["content"]
         },
         "reference_models": [],
-        "aggregator": None,
-        "majority_vote": majority_vote,
+        "intermediate_aggregators": [],
+        "final_aggregator": None,
         "winner": winner,
+        "majority_vote": majority_vote,
         "winner_text": "B" if is_shuffled else "A",
         "loser_text": "A" if is_shuffled else "B",
         "is_shuffled": is_shuffled
     }
 
     if args.moa:
-        reference_judgments, aggregator_judgment = judgement
-        for model, judgment in zip(args.reference_models, reference_judgments):
-            if args.evaluation_style == "binary":
+        if args.three_layer_moa:
+            reference_judgments, intermediate_judgments, final_judgment = judgement
+            for model, judgment in zip(args.reference_models, reference_judgments):
                 detailed_results["reference_models"].append({
                     "model": model,
                     "output": judgment
                 })
-            else:  # score-based
-                judgment_a, judgment_b = judgment
-                detailed_results["reference_models"].append({
-                    "model": model,
-                    "output_a": judgment_a,
-                    "output_b": judgment_b
-                })
-        detailed_results["aggregator"] = {
-            "model": args.aggregator_model,
-            "output": aggregator_judgment
-        }
-    else:
-        if isinstance(args.model, list):
-            for model, judgment in zip(args.model, judgement):
-                detailed_results["reference_models"].append({
+            for model, judgment in zip(args.intermediate_aggregators, intermediate_judgments):
+                detailed_results["intermediate_aggregators"].append({
                     "model": model,
                     "output": judgment
                 })
+            detailed_results["final_aggregator"] = {
+                "model": args.final_aggregator,
+                "output": final_judgment
+            }
         else:
-            detailed_results["reference_models"].append({
-                "model": args.model,
-                "output": judgement
-            })
+            reference_judgments, final_judgment = judgement
+            for model, judgment in zip(args.model[:-1], reference_judgments):
+                detailed_results["reference_models"].append({
+                    "model": model,
+                    "output": judgment
+                })
+            detailed_results["final_aggregator"] = {
+                "model": args.model[-1],
+                "output": final_judgment
+            }
+    else:
+        detailed_results["reference_models"].append({
+            "model": args.model,
+            "output": judgement
+        })
 
     result_file_path = get_result_file_path(example_id, args)
     os.makedirs(os.path.dirname(result_file_path), exist_ok=True)
     with open(result_file_path, 'w') as f:
         json.dump(detailed_results, f, indent=2)
     return detailed_results
-
 
 def chat_completion_together(model, conv, temperature, max_tokens, api_dict=None):
     client = Together(api_key=os.environ["TOGETHER_API_KEY"])
